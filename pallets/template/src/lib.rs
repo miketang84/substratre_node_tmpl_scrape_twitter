@@ -18,10 +18,16 @@ mod benchmarking;
 use sp_runtime::{
     offchain::{
         http, Duration,
+        storage::{StorageValueRef},
     },
 };
 
-use serde::{Deserialize, Deserializer};
+use serde::{Deserialize,};
+
+
+const TWITTER_HANDLE: &'static str = "MikeTang84";
+const TWITTER_SEARCH_URL: &'static str = "https://api.twitter.com/2/tweets/search/recent?max_results=10&query=";
+const TWITTER_BEARER_AUTH_TOKEN: &'static str = "Bearer AAAAAAAAAAAAAAAAAAAAAHREhgEAAAAAOHbZhkfUUEQZG6nS%2F7e5czItcmo%3DwHK5WacHISwtj8XgB4kxZYp5bgZwXobVIDDIx00YKDrCILyn5A";
 
 
 #[frame_support::pallet]
@@ -32,33 +38,38 @@ pub mod pallet {
     use sp_std::vec::Vec;
 
     #[derive(Deserialize, Encode, Decode)]
-    struct GithubInfo {
-        #[serde(deserialize_with = "de_string_to_bytes")]
-        login: Vec<u8>,
-        #[serde(deserialize_with = "de_string_to_bytes")]
-        blog: Vec<u8>,
-        public_repos: u32,
+    struct Tweet {
+        #[serde(with = "serde_bytes")]
+        id: Vec<u8>,
+        #[serde(with = "serde_bytes")]
+        text: Vec<u8>,
     }
 
-    pub fn de_string_to_bytes<'de, D>(de: D) -> Result<Vec<u8>, D::Error>
-        where
-        D: Deserializer<'de>,
-        {
-            let s: &str = Deserialize::deserialize(de)?;
-            Ok(s.as_bytes().to_vec())
-        }
-
     use core::{convert::TryInto, fmt};
-    impl fmt::Debug for GithubInfo {
+    impl fmt::Debug for Tweet {
         fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
             write!(
                 f,
-                "{{ login: {}, blog: {}, public_repos: {} }}",
-                sp_std::str::from_utf8(&self.login).map_err(|_| fmt::Error)?,
-                sp_std::str::from_utf8(&self.blog).map_err(|_| fmt::Error)?,
-                &self.public_repos
+                "{{ id: {}, text: {} }}",
+                sp_std::str::from_utf8(&self.id).map_err(|_| fmt::Error)?,
+                sp_std::str::from_utf8(&self.text).map_err(|_| fmt::Error)?,
                 )
         }
+    }
+
+    #[derive(Deserialize, Encode, Decode, Debug)]
+    struct TwitterMeta {
+        #[serde(with = "serde_bytes")]
+        oldest_id: Vec<u8>,
+        #[serde(with = "serde_bytes")]
+        newest_id: Vec<u8>,
+        result_count: u32,
+    }
+
+    #[derive(Deserialize, Encode, Decode, Debug)]
+    struct TwitterResponse {
+        data: Vec<Tweet>,
+        //meta: TwitterMeta
     }
 
     #[pallet::pallet]
@@ -148,13 +159,18 @@ pub mod pallet {
         fn offchain_worker(block_number: T::BlockNumber) {
             log::info!("Hello World from offchain workers!: {:?}", block_number);
 
-            if let Ok(info) = Self::fetch_github_info() {
+            if let Ok(tweets) = Self::fetch_tweets() {
 
-                log::info!("Github Info: {:?}", info);
+                log::info!("get tweets: {:?}", tweets.data.len());
+
+                let key = Self::derive_key(block_number);
+                let val_ref = StorageValueRef::persistent(&key);
+
+                val_ref.set(&tweets);
 
             } else {
 
-                log::info!("Error while fetch github info!");
+                log::info!("Error while fetch tweets!");
 
             }
 
@@ -165,7 +181,6 @@ pub mod pallet {
     }
 
     impl<T: Config> Pallet<T> {
-/*
         #[deny(clippy::clone_double_ref)]
         fn derive_key(block_number: T::BlockNumber) -> Vec<u8> {
             block_number.using_encoded(|encoded_bn| {
@@ -176,14 +191,26 @@ pub mod pallet {
                     .collect::<Vec<u8>>()
             })
         }
-*/
-        fn fetch_github_info() -> Result<GithubInfo, http::Error> {
+
+        fn fetch_tweets() -> Result<TwitterResponse, http::Error> {
+
+            let mut url = Vec::new();
+            let base_url = TWITTER_SEARCH_URL.as_bytes().to_vec();
+            url.extend(base_url);
+            url.extend(b"from:");
+            url.extend(TWITTER_HANDLE.bytes());
+            let url_str = sp_std::str::from_utf8(&url).map_err(|_| {
+                log::warn!("No UTF8 url");
+                http::Error::Unknown
+            })?;
+
             // prepare for send request
             let deadline = sp_io::offchain::timestamp().add(Duration::from_millis(8_000));
             let request =
-                http::Request::get("https://api.github.com/orgs/substrate-developer-hub");
+                http::Request::get(url_str);
             let pending = request
                 .add_header("User-Agent", "Substrate-Offchain-Worker")
+                .add_header("Authorization", TWITTER_BEARER_AUTH_TOKEN)
                 .deadline(deadline).send().map_err(|_| http::Error::IoError)?;
             let response = pending.try_wait(deadline).map_err(|_| http::Error::DeadlineReached)??;
             if response.code != 200 {
@@ -195,12 +222,18 @@ pub mod pallet {
                 log::warn!("No UTF8 body");
                 http::Error::Unknown
             })?;
+            log::info!("response body: {:?}", body_str);
 
-            // parse the response str
-            let gh_info: GithubInfo =
-                serde_json::from_str(body_str).map_err(|_| http::Error::Unknown)?;
+            // parse the response str, this is a array of tweets
+            let tweets: TwitterResponse =
+                    serde_json::from_str(body_str).map_err(|_| http::Error::Unknown)?;
+            log::info!("tweets: {:?}", tweets);
+            
+            for tweet in tweets.data.iter() {
+                log::info!("tweet: {:?}", tweet);
+            }   
 
-            Ok(gh_info)
+            Ok(tweets)
         }
 
     }
